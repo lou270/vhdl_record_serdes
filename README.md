@@ -29,6 +29,13 @@ Le tout dans un package + package body (`<entrée>_serdes_pkg.vhd` par défaut).
 python -m vhdl_serdes examples/example_pkg.vhd -o examples/example_serdes_pkg.vhd
 ```
 
+Un **dossier** est parcouru automatiquement (récursivement) à la recherche des
+fichiers VHDL :
+
+```bash
+python -m vhdl_serdes rtl/ -o rtl/projet_serdes_pkg.vhd
+```
+
 Inspection sans génération :
 
 ```bash
@@ -43,8 +50,8 @@ timestamp_t  (examples/example_pkg.vhd:15)  -> 48 bits
     [  47 :   32]  ticks : unsigned(15 downto 0)
 ```
 
-Plusieurs fichiers d'entrée sont acceptés ; tous les records trouvés sont générés
-dans un seul package, dans un ordre qui respecte leurs dépendances.
+Fichiers et dossiers peuvent être mélangés ; tous les records trouvés sont
+générés dans un seul package, dans un ordre qui respecte leurs dépendances.
 
 Installation optionnelle (fournit la commande `vhdl-serdes`) :
 
@@ -127,11 +134,46 @@ end record burst_t;
 - pour un champ déclaré `downto`, la désérialisation passe par un temporaire et
   une boucle indexée, afin que l'index le plus faible reste sur les LSB.
 
+## Parcours de dossier
+
+Un argument qui désigne un dossier est parcouru récursivement (`--no-recursive`
+pour rester au premier niveau) à la recherche des extensions `.vhd` et `.vhdl`
+(`--ext` pour en définir d'autres). Les fichiers sont lus dans l'ordre
+alphabétique de leur chemin, mais **cet ordre n'a pas d'importance** : les
+déclarations de type sont d'abord collectées dans tous les fichiers, puis les
+records sont résolus. Un record peut donc en utiliser un autre défini dans un
+fichier lu plus tard.
+
+La tolérance aux erreurs dépend de la façon dont le fichier est arrivé :
+
+| Fichier | Erreur de lecture ou record non supporté |
+|---------|------------------------------------------|
+| nommé explicitement | erreur, l'outil s'arrête |
+| trouvé dans un dossier | ignoré, avec un avertissement |
+
+Un record ignoré entraîne l'abandon de ceux qui le contiennent, signalé
+également. `--strict` transforme tous ces avertissements en erreur.
+
+```
+$ python -m vhdl_serdes rtl/ --list
+3 fichier(s) lu(s), 3 record(s) trouve(s)
+avertissement: record 'stats_t' ignore: rtl/common/misc_pkg.vhd:2: stats_t.count:
+  type 'integer' non supporte (utilisez unsigned/signed avec une largeur explicite)
+avertissement: record 'uses_stats_t' ignore: rtl/common/misc_pkg.vhd:8: contient
+  le record 'stats_t' qui a ete ignore
+```
+
+Le fichier désigné par `-o` est exclu du parcours : régénérer dans le dossier
+scanné ne relit pas la sortie précédente. Le nom de package par défaut vient
+alors du nom du dossier (`rtl/` → `rtl_serdes_pkg`).
+
 ## Options
 
 | Option | Effet |
 |--------|-------|
-| `-o, --output FICHIER` | fichier généré (défaut : stdout) |
+| `-o, --output FICHIER` | fichier généré (défaut : stdout) ; exclu du parcours |
+| `--no-recursive` | ne pas descendre dans les sous-dossiers |
+| `--ext EXT` | extension cherchée dans un dossier (répétable ; défaut `.vhd`, `.vhdl`) |
 | `-l, --list` | liste les records et leur cartographie, sans générer |
 | `-p, --package-name NOM` | nom du package généré (défaut : `<entrée sans _pkg>_serdes_pkg`) |
 | `-r, --record NOM` | ne traiter que ce record (répétable ; les records imbriqués nécessaires sont ajoutés) |

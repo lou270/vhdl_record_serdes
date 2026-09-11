@@ -135,8 +135,26 @@ class _Resolved:
     array: ArrayInfo | None = None
 
 
+@dataclass
+class _RecordBody:
+    """A record declaration whose body is not resolved yet."""
+
+    name: str
+    body: str
+    package: str | None
+    source: str
+    line: int
+    discovered: bool = False   # found by scanning a directory, not listed
+
+
 class VhdlSource:
-    """The declarations collected from one or more VHDL files."""
+    """The declarations collected from one or more VHDL files.
+
+    Reading happens in two passes: ``add_file`` / ``add_text`` collect the type
+    declarations, then ``finalize`` resolves the record bodies. That way a
+    record may use a record declared in a file read later, which matters as
+    soon as the files come from scanning a directory.
+    """
 
     def __init__(self, naming: Naming | None = None) -> None:
         self.naming = naming or Naming()
@@ -145,9 +163,12 @@ class VhdlSource:
         self.packages: list[str] = []
         self.order: list[str] = []                # record names, in source order
         self.warnings: list[str] = []
+        self.skipped: dict[str, str] = {}         # record name -> reason
+        self._bodies: dict[str, _RecordBody] = {}
+        self._finalized = False
 
     # -- parsing ---------------------------------------------------------
-    def add_file(self, path: str | Path) -> None:
+    def add_file(self, path: str | Path, discovered: bool = False) -> None:
         p = Path(path)
         if not p.is_file():
             raise VhdlSerdesError(f"fichier introuvable: {p}")
@@ -155,9 +176,14 @@ class VhdlSource:
             raw = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             raw = p.read_text(encoding="latin-1")
-        self.add_text(raw, source=str(p))
+        self.add_text(raw, source=str(p), discovered=discovered)
 
-    def add_text(self, raw: str, source: str = "<text>") -> None:
+    def add_text(self, raw: str, source: str = "<text>",
+                 discovered: bool = False) -> None:
+        if self._finalized:
+            raise VhdlSerdesError(
+                "VhdlSource.finalize() a deja ete appele, plus rien ne peut "
+                "etre ajoute")
         text = strip_comments(raw)
 
         packages = [(m.start(), m.group(1)) for m in _RE_PACKAGE.finditer(text)]
@@ -185,19 +211,71 @@ class VhdlSource:
             for off, pname in packages:
                 if off < m.start():
                     pkg = pname
-            rec = RecordDef(name=name, package=pkg, source=source, line=line)
-            self._add_decl(_TypeDecl("record", name, source=source, line=line))
             key = name.lower()
-            if key in self.records:
-                prev = self.records[key]
-                raise VhdlSerdesError(
-                    f"{source}:{line}: le record '{name}' est deja defini dans "
-                    f"{prev.source}:{prev.line}")
+            previous = self._bodies.get(key)
+            if previous is not None:
+                message = (f"{source}:{line}: le record '{name}' est deja "
+                           f"defini dans {previous.source}:{previous.line}")
+                if not discovered:
+                    raise VhdlSerdesError(message)
+                self.warnings.append(f"{message} ; la seconde est ignoree")
+                continue
+            self._add_decl(_TypeDecl("record", name, source=source, line=line))
+            self._bodies[key] = _RecordBody(
+                name=name, body=text[m.end():end.start()], package=pkg,
+                source=source, line=line, discovered=discovered)
+
+    def finalize(self) -> None:
+        """Resolve every record body once all the files have been read.
+
+        A record that cannot be resolved is reported as an error when its file
+        was named on the command line, and skipped with a warning when the file
+        was merely discovered while scanning a directory.
+        """
+        if self._finalized:
+            return
+        self._finalized = True
+
+        for key, body in self._bodies.items():
+            rec = RecordDef(name=body.name, package=body.package,
+                            source=body.source, line=body.line)
+            try:
+                rec.fields = self._parse_body(rec, body.body, body.line)
+            except VhdlSerdesError as exc:
+                if not body.discovered:
+                    raise
+                self._skip(key, body.name, str(exc))
+                continue
             self.records[key] = rec
-            self.order.append(name)
-            rec.fields = self._parse_body(rec, text[m.end():end.start()], line)
+            self.order.append(rec.name)
 
         self._link_vector_types()
+        self._cascade_skips()
+
+    def _skip(self, key: str, name: str, reason: str) -> None:
+        self.skipped[key] = reason
+        self.warnings.append(f"record '{name}' ignore: {reason}")
+
+    def _cascade_skips(self) -> None:
+        """Drop the records that depend on a record which was skipped."""
+        changed = True
+        while changed:
+            changed = False
+            for key in list(self.records):
+                rec = self.records[key]
+                for dep in rec.dependencies:
+                    if dep.lower() not in self.skipped:
+                        continue
+                    reason = (f"{rec.source}:{rec.line}: contient le record "
+                              f"'{dep}' qui a ete ignore")
+                    if not self._bodies[key].discovered:
+                        raise VhdlSerdesError(
+                            f"{reason} ({self.skipped[dep.lower()]})")
+                    del self.records[key]
+                    self.order.remove(rec.name)
+                    self._skip(key, rec.name, reason)
+                    changed = True
+                    break
 
     def _parse_arrays(self, text: str, source: str) -> None:
         for m in _RE_ARRAY_HEAD.finditer(text):
@@ -480,8 +558,58 @@ def _line_of(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
-def parse_files(paths: list, naming: Naming | None = None) -> VhdlSource:
+#: Extensions looked for when an input path is a directory.
+DEFAULT_EXTENSIONS = (".vhd", ".vhdl")
+
+
+def collect_vhdl_files(paths: list, extensions: tuple = DEFAULT_EXTENSIONS,
+                       recursive: bool = True, exclude: list | None = None
+                       ) -> list[tuple[Path, bool]]:
+    """Expand the inputs into ``(file, discovered)`` pairs, without duplicates.
+
+    A path naming a file is taken as is; a path naming a directory is scanned
+    for ``extensions`` and the files found are flagged as discovered, which
+    makes the parser tolerant about the ones it cannot handle.
+    """
+    suffixes = tuple(e.lower() if e.startswith(".") else f".{e.lower()}"
+                     for e in extensions)
+    skip = {Path(p).resolve() for p in (exclude or [])}
+    found: dict[Path, bool] = {}
+
+    for raw in paths:
+        path = Path(raw)
+        if path.is_file():
+            found.setdefault(path.resolve(), False)
+            continue
+        if not path.is_dir():
+            raise VhdlSerdesError(f"fichier ou dossier introuvable: {path}")
+        pattern = "**/*" if recursive else "*"
+        matches = sorted(p for p in path.glob(pattern)
+                         if p.is_file() and p.suffix.lower() in suffixes)
+        if not matches:
+            raise VhdlSerdesError(
+                f"aucun fichier {'/'.join(suffixes)} dans {path}"
+                + ("" if recursive else " (sans --no-recursive ?)"))
+        for match in matches:
+            resolved = match.resolve()
+            if resolved not in skip:
+                found.setdefault(resolved, True)
+
+    if not found:
+        raise VhdlSerdesError("aucun fichier a lire")
+    return list(found.items())
+
+
+def parse_files(paths: list, naming: Naming | None = None,
+                **kwargs) -> VhdlSource:
+    """Read every input (file or directory) and resolve the records."""
     src = VhdlSource(naming)
-    for p in paths:
-        src.add_file(p)
+    for path, discovered in collect_vhdl_files(paths, **kwargs):
+        try:
+            src.add_file(path, discovered=discovered)
+        except VhdlSerdesError as exc:
+            if not discovered:
+                raise
+            src.warnings.append(f"fichier ignore: {exc}")
+    src.finalize()
     return src

@@ -10,11 +10,11 @@ from .generator import (GenOptions, element_base, generate, layout,
                         record_width, sort_records, static_sizes)
 from .model import (DEFAULT_TYPE_SUFFIXES, FieldKind, Naming, RecordDef,
                     VhdlSerdesError)
-from .parser import VhdlSource
+from .parser import DEFAULT_EXTENSIONS, VhdlSource, collect_vhdl_files
 
 DESCRIPTION = """\
 Genere les fonctions VHDL de serialisation / deserialisation des records
-trouves dans un ou plusieurs fichiers VHDL.
+trouves dans les fichiers VHDL donnes, ou dans les dossiers parcourus.
 
 Pour chaque record de type <nom>_t (ou <nom>_type) sont generes :
   constant <NOM>_SERIALIZED_WIDTH : natural := ...;
@@ -27,6 +27,10 @@ faible (offset 0), le dernier les bits de poids fort. Un record imbrique est
 serialise via les fonctions de la meme convention de nommage ; si son type
 n'est pas present dans les fichiers d'entree, ces fonctions sont supposees
 exister (avertissement).
+
+Un fichier explicitement nomme doit etre exploitable : toute erreur est
+signalee. Dans un dossier parcouru, un fichier ou un record que l'outil ne
+sait pas traiter est ignore avec un avertissement (--strict pour arreter).
 """
 
 
@@ -36,8 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("inputs", nargs="+", metavar="FICHIER.vhd",
-                   help="fichier(s) VHDL contenant les declarations de record")
+    p.add_argument("inputs", nargs="+", metavar="CHEMIN",
+                   help="fichier(s) VHDL, ou dossier(s) a parcourir "
+                        "(recursivement) a la recherche de fichiers VHDL")
     p.add_argument("-o", "--output", metavar="FICHIER",
                    help="fichier VHDL genere (defaut: stdout)")
     p.add_argument("-l", "--list", action="store_true",
@@ -95,6 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-assert", action="store_true",
                    help="ne pas generer l'assertion de controle de largeur "
                         "dans les fonctions de deserialisation")
+    g = p.add_argument_group("parcours de dossier")
+    g.add_argument("--no-recursive", action="store_true",
+                   help="ne pas descendre dans les sous-dossiers")
+    g.add_argument("--ext", action="append", default=[], metavar="EXT",
+                   help="extension a chercher dans un dossier (repetable ; "
+                        "defaut: " + ", ".join(DEFAULT_EXTENSIONS) + ")")
+
     p.add_argument("--strict", action="store_true",
                    help="traiter les avertissements (type inconnu suppose "
                         "record) comme des erreurs")
@@ -109,6 +121,9 @@ def _select(src: VhdlSource, only: list[str], exclude: list[str]) -> list[Record
         for name in only:
             rec = known.get(name.lower())
             if rec is None:
+                if name.lower() in src.skipped:
+                    raise VhdlSerdesError(
+                        f"record '{name}' ignore: {src.skipped[name.lower()]}")
                 raise VhdlSerdesError(
                     f"record '{name}' introuvable ; disponibles: "
                     f"{', '.join(src.order) or '(aucun)'}")
@@ -193,12 +208,29 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
+        files = collect_vhdl_files(
+            args.inputs,
+            extensions=tuple(args.ext) if args.ext else DEFAULT_EXTENSIONS,
+            recursive=not args.no_recursive,
+            exclude=[args.output] if args.output else None)
+        scanned = sum(1 for _, discovered in files if discovered)
+
         src = VhdlSource(naming)
-        for path in args.inputs:
-            src.add_file(path)
+        for path, discovered in files:
+            try:
+                src.add_file(path, discovered=discovered)
+            except VhdlSerdesError as exc:
+                if not discovered:
+                    raise
+                src.warnings.append(f"fichier ignore: {exc}")
+        src.finalize()
+
+        if scanned:
+            print(f"{len(files)} fichier(s) lu(s), {len(src.records)} record(s) "
+                  f"trouve(s)", file=sys.stderr)
         if not src.records:
             raise VhdlSerdesError(
-                "aucun record trouve dans " + ", ".join(args.inputs))
+                "aucun record exploitable dans " + ", ".join(args.inputs))
 
         records = _select(src, args.record, args.exclude)
 
@@ -233,12 +265,13 @@ def main(argv: list[str] | None = None) -> int:
             print(_describe(records, naming))
             return 0
 
-        stem = Path(args.inputs[0]).stem
+        first = Path(args.inputs[0])
+        stem = first.resolve().name if first.is_dir() else first.stem
         for tail in ("_pkg", "_package", "-pkg"):
             if stem.lower().endswith(tail):
                 stem = stem[: -len(tail)]
                 break
-        default_pkg = stem + "_serdes_pkg"
+        default_pkg = (stem or "vhdl") + "_serdes_pkg"
         use_packages = [] if args.no_auto_use else list(src.packages)
         extra_use: list[str] = []
         for item in args.use:
