@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Outils
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editeurs et OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Simulation VHDL
+work/
+*.cf
+*.ghw
+*.vcd
+transcript
