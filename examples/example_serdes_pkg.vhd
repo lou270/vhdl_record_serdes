@@ -3,7 +3,8 @@
 --
 -- Record serialization helpers. Packing convention: the first field of a
 -- record occupies the least significant bits, the last field the most
--- significant ones. A nested record is serialized through the functions
+-- significant ones; in an array, the lowest index occupies the least
+-- significant bits. A nested record is serialized through the functions
 -- of the same naming convention.
 --
 -- Source(s):
@@ -44,8 +45,12 @@ package example_serdes_pkg is
   function header_record2slv (value : header_t) return std_logic_vector;
   function header_slv2record (data : std_logic_vector) return header_t;
 
+  -- header_vector: serialized element by element, lowest index on the LSBs
+  function header_recordvector2slv (value : header_vector) return std_logic_vector;
+  function header_slv2recordvector (data : std_logic_vector) return header_vector;
+
   -----------------------------------------------------------------------------
-  -- frame_t  (examples\example_pkg.vhd:29)
+  -- frame_t  (examples\example_pkg.vhd:34)
   -----------------------------------------------------------------------------
   -- Bit map, first field on the LSBs:
   --   [  60 :    0]  hdr : header_t
@@ -56,6 +61,19 @@ package example_serdes_pkg is
 
   function frame_record2slv (value : frame_t) return std_logic_vector;
   function frame_slv2record (data : std_logic_vector) return frame_t;
+
+  -----------------------------------------------------------------------------
+  -- burst_t  (examples\example_pkg.vhd:42)
+  -----------------------------------------------------------------------------
+  -- Bit map, first field on the LSBs:
+  --   [ 121 :    0]  headers : header_vector(0 to 1)  (lowest index on the LSBs)
+  --   [ 153 :  122]  padding : byte_vector(0 to 3)  (lowest index on the LSBs)
+  --   [ 161 :  154]  count : unsigned(7 downto 0)
+  --   total: 162 bits
+  constant BURST_SERIALIZED_WIDTH : natural := (2 * HEADER_SERIALIZED_WIDTH) + 32 + 8;  -- 162 bits
+
+  function burst_record2slv (value : burst_t) return std_logic_vector;
+  function burst_slv2record (data : std_logic_vector) return burst_t;
 
 end package example_serdes_pkg;
 
@@ -128,6 +146,35 @@ package body example_serdes_pkg is
     return result;
   end function header_slv2record;
 
+  function header_recordvector2slv (value : header_vector) return std_logic_vector is
+    variable result      : std_logic_vector(value'length * HEADER_SERIALIZED_WIDTH - 1 downto 0);
+    variable element_low : natural;
+  begin
+    for i in value'range loop
+      element_low := (i - value'low) * HEADER_SERIALIZED_WIDTH;
+      result(element_low + HEADER_SERIALIZED_WIDTH - 1 downto element_low) := header_record2slv(value(i));
+    end loop;
+    return result;
+  end function header_recordvector2slv;
+
+  function header_slv2recordvector (data : std_logic_vector) return header_vector is
+    constant COUNT       : natural := data'length / HEADER_SERIALIZED_WIDTH;
+    variable src         : std_logic_vector(data'length - 1 downto 0);
+    variable result      : header_vector(0 to COUNT - 1);
+    variable element_low : natural;
+  begin
+    assert data'length = COUNT * HEADER_SERIALIZED_WIDTH
+      report "header_slv2recordvector: expected " & integer'image(COUNT * HEADER_SERIALIZED_WIDTH)
+             & " bits, got " & integer'image(data'length)
+      severity failure;
+    src := data;
+    for i in result'range loop
+      element_low := (i - result'low) * HEADER_SERIALIZED_WIDTH;
+      result(i) := header_slv2record(src(element_low + HEADER_SERIALIZED_WIDTH - 1 downto element_low));
+    end loop;
+    return result;
+  end function header_slv2recordvector;
+
   -----------------------------------------------------------------------------
   -- frame_t
   -----------------------------------------------------------------------------
@@ -164,5 +211,47 @@ package body example_serdes_pkg is
     result.last   := src(FRAME_LAST_LOW);
     return result;
   end function frame_slv2record;
+
+  -----------------------------------------------------------------------------
+  -- burst_t
+  -----------------------------------------------------------------------------
+  constant BURST_HEADERS_LOW  : natural := 0;
+  constant BURST_HEADERS_HIGH : natural := BURST_HEADERS_LOW + (2 * HEADER_SERIALIZED_WIDTH) - 1;
+  constant BURST_PADDING_LOW  : natural := BURST_HEADERS_HIGH + 1;
+  constant BURST_PADDING_HIGH : natural := BURST_PADDING_LOW + 31;
+  constant BURST_COUNT_LOW    : natural := BURST_PADDING_HIGH + 1;
+  constant BURST_COUNT_HIGH   : natural := BURST_COUNT_LOW + 7;
+
+  function burst_record2slv (value : burst_t) return std_logic_vector is
+    variable result      : std_logic_vector(BURST_SERIALIZED_WIDTH - 1 downto 0);
+    variable element_low : natural;
+  begin
+    result(BURST_HEADERS_HIGH downto BURST_HEADERS_LOW) := header_recordvector2slv(value.headers);
+    for i in value.padding'range loop
+      element_low := BURST_PADDING_LOW + (i - value.padding'low) * 8;
+      result(element_low + 7 downto element_low) := value.padding(i);
+    end loop;
+    result(BURST_COUNT_HIGH downto BURST_COUNT_LOW) := std_logic_vector(value.count);
+    return result;
+  end function burst_record2slv;
+
+  function burst_slv2record (data : std_logic_vector) return burst_t is
+    variable src         : std_logic_vector(BURST_SERIALIZED_WIDTH - 1 downto 0);
+    variable result      : burst_t;
+    variable element_low : natural;
+  begin
+    assert data'length = BURST_SERIALIZED_WIDTH
+      report "burst_slv2record: expected " & integer'image(BURST_SERIALIZED_WIDTH)
+             & " bits, got " & integer'image(data'length)
+      severity failure;
+    src := data;
+    result.headers := header_slv2recordvector(src(BURST_HEADERS_HIGH downto BURST_HEADERS_LOW));
+    for i in result.padding'range loop
+      element_low := BURST_PADDING_LOW + (i - result.padding'low) * 8;
+      result.padding(i) := src(element_low + 7 downto element_low);
+    end loop;
+    result.count := unsigned(src(BURST_COUNT_HIGH downto BURST_COUNT_LOW));
+    return result;
+  end function burst_slv2record;
 
 end package body example_serdes_pkg;

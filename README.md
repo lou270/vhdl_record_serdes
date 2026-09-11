@@ -11,6 +11,13 @@ function frame_record2slv (value : frame_t) return std_logic_vector;     -- reco
 function frame_slv2record (data : std_logic_vector) return frame_t;      -- slv -> record
 ```
 
+et, si un type tableau `frame_vector` existe, les deux fonctions correspondantes :
+
+```vhdl
+function frame_recordvector2slv (value : frame_vector) return std_logic_vector;
+function frame_slv2recordvector (data : std_logic_vector) return frame_vector;
+```
+
 Seul le **début** du nom de type est conservé : le suffixe de type (`_t`, `_type`)
 est retiré pour nommer les fonctions et les constantes.
 
@@ -63,6 +70,10 @@ end record header_t;
 La cartographie des bits est rappelée en commentaire au-dessus de chaque
 constante générée.
 
+Dans un champ tableau, **l'élément d'index le plus faible occupe les bits de
+poids faible**, quel que soit le sens de l'intervalle (`0 to 3` comme
+`3 downto 0`).
+
 ## Types de champ supportés
 
 | Type                                        | Largeur                | Conversion générée |
@@ -72,6 +83,8 @@ constante générée.
 | `unsigned`, `signed`                         | bornes de l'intervalle | `std_logic_vector(...)` / `unsigned(...)`, `signed(...)` |
 | `subtype` d'un des types ci-dessus           | résolue                | selon le type de base |
 | record imbriqué                              | `<NESTED>_SERIALIZED_WIDTH` | `<nested>_record2slv` / `<nested>_slv2record` |
+| tableau de records                           | `count * <ELEM>_SERIALIZED_WIDTH` | `<elem>_recordvector2slv` / `<elem>_slv2recordvector` |
+| tableau de `std_logic` / slv / unsigned / signed | `count * largeur élément` | boucle élément par élément, sans fonction auxiliaire |
 
 Les bornes peuvent être des expressions non statiques (`std_logic_vector(DATA_W - 1 downto 0)`) :
 la largeur est alors reportée telle quelle dans le VHDL généré.
@@ -85,8 +98,34 @@ avertissement est émis ; `--strict` en fait une erreur).
 
 Types refusés volontairement, faute d'encodage binaire évident :
 `integer`, `natural`, `positive`, `boolean`, `real`, `time`, `character`,
-`string`, `bit`, `bit_vector`, types énumérés, tableaux. Le message d'erreur
-indique le remplacement attendu.
+`string`, `bit`, `bit_vector`, types énumérés, tableaux multidimensionnels et
+tableaux de tableaux. Le message d'erreur indique le remplacement attendu.
+
+### Tableaux
+
+Un nom de type record ne peut pas porter d'intervalle en VHDL : un tableau de
+records passe par un type tableau, **nommé `<base>_vector` par convention**.
+
+```vhdl
+type header_vector is array (natural range <>) of header_t;   -- la convention
+
+type burst_t is record
+  headers : header_vector(0 to 1);          -- index 0 sur les bits de poids faible
+  padding : byte_vector(0 to 3);            -- tableau scalaire, boucle inline
+  count   : unsigned(7 downto 0);
+end record burst_t;
+```
+
+- les fonctions vectorielles d'un record sont générées dès qu'un type tableau
+  portant sur lui est trouvé dans les entrées ; déclarez-le si vous les voulez ;
+- un type tableau peut être contraint (`array (0 to 3) of header_t`) : le champ
+  s'écrit alors sans intervalle, et les fonctions générées s'adaptent ;
+- si le type tableau n'est dans aucun fichier d'entrée, il est supposé suivre la
+  convention et ses fonctions supposées exister (avertissement) ;
+- un type tableau qui dévie de la convention (`header_array_t`) est accepté et
+  signalé : les fonctions générées prennent bien le type réel ;
+- pour un champ déclaré `downto`, la désérialisation passe par un temporaire et
+  une boucle indexée, afin que l'index le plus faible reste sur les LSB.
 
 ## Options
 
@@ -103,6 +142,9 @@ indique le remplacement attendu.
 | `--width-suffix SUFF` | suffixe de la constante de largeur (défaut `SERIALIZED_WIDTH`) |
 | `--serialize-suffix SUFF` | défaut `record2slv` |
 | `--deserialize-suffix SUFF` | défaut `slv2record` |
+| `--vector-suffix SUFF` | suffixe du type tableau d'un record (défaut `vector`) |
+| `--serialize-vector-suffix SUFF` | défaut `recordvector2slv` |
+| `--deserialize-vector-suffix SUFF` | défaut `slv2recordvector` |
 | `--library LIB` | bibliothèque des packages source (défaut `work`) |
 | `--use PKG` | clause `use` supplémentaire (`pkg` ou `use lib.pkg.all;`) |
 | `--no-auto-use` | ne pas déduire les clauses `use` des packages d'entrée |
@@ -116,6 +158,8 @@ Par défaut le suffixe de type est retiré : `frame_t` comme `frame_type` donnen
 le plus long l'emporte, et un suffixe ne peut jamais consommer tout le nom.
 
 - `--strip-type-suffix _rec` remplace la liste par défaut (répétable) ;
+- `--vector-suffix`, `--serialize-vector-suffix` et
+  `--deserialize-vector-suffix` ajustent la convention des tableaux ;
 - `--strip-type-prefix t_` retire aussi un préfixe (`t_frame_type` → `frame`) ;
 - `--keep-type-suffix` conserve le nom complet (`frame_t_record2slv`).
 
@@ -165,7 +209,8 @@ Notes :
 
 - Le générateur ne déplace pas les champs : l'ordre de déclaration **est** le
   format binaire. Réordonner un record change le format.
-- Les tableaux et types énumérés ne sont pas supportés (choix explicite).
+- Les types énumérés, les tableaux multidimensionnels et les tableaux de
+  tableaux ne sont pas supportés (choix explicite).
 - Un record déclaré hors d'un package (dans une architecture par exemple) est
   traité, mais le package généré ne peut pas voir le type : l'outil le signale
   et il faut déplacer le record dans un package.

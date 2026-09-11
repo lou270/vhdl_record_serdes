@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
-from .model import Field, FieldKind, RecordDef, VhdlSerdesError, Width, eval_static
+from .model import (ArrayInfo, Field, FieldKind, Naming, RecordDef, VectorType,
+                    VhdlSerdesError, Width, eval_static)
 
 _SL_TYPES = {"std_logic", "std_ulogic"}
 _SLV_TYPES = {"std_logic_vector", "std_ulogic_vector"}
@@ -30,7 +31,8 @@ _UNSUPPORTED_SCALARS = {
 _RE_PACKAGE = re.compile(r"\bpackage\s+(?!body\b)([A-Za-z]\w*)\s+is\b", re.I)
 _RE_RECORD = re.compile(r"\btype\s+([A-Za-z]\w*)\s+is\s+record\b", re.I)
 _RE_END_RECORD = re.compile(r"\bend\s+record\b", re.I)
-_RE_ARRAY = re.compile(r"\btype\s+([A-Za-z]\w*)\s+is\s+array\b", re.I)
+_RE_ARRAY_HEAD = re.compile(r"\btype\s+([A-Za-z]\w*)\s+is\s+array\s*\(", re.I)
+_RE_ARRAY_TAIL = re.compile(r"\s*of\s+([^;]+);", re.I | re.S)
 _RE_ENUM = re.compile(r"\btype\s+([A-Za-z]\w*)\s+is\s*\(", re.I)
 _RE_SUBTYPE = re.compile(r"\bsubtype\s+([A-Za-z]\w*)\s+is\s+([^;]+);", re.I)
 
@@ -96,19 +98,48 @@ def _find_top_level(text: str, pattern: str) -> int:
     return -1
 
 
+def _matching_paren(text: str, open_at: int) -> int:
+    """Offset of the ``)`` closing the ``(`` at ``open_at``, or -1."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
 @dataclass
 class _TypeDecl:
-    kind: str          # record | array | enum | subtype
+    kind: str                    # record | array | enum | subtype
     name: str
-    payload: str = ""  # subtype: the type mark it aliases
+    payload: str = ""            # subtype: aliased type mark; array: element type
+    index_text: str = ""         # array: index constraint as written
+    unconstrained: bool = False  # array: declared 'array (<type> range <>)'
+    multi_dim: bool = False
     source: str = ""
     line: int = 0
+
+
+@dataclass
+class _Resolved:
+    """Outcome of resolving one type mark."""
+
+    kind: FieldKind
+    base_type: str
+    width: Width = dc_field(default_factory=Width)
+    record_type: str | None = None
+    external: bool = False
+    array: ArrayInfo | None = None
 
 
 class VhdlSource:
     """The declarations collected from one or more VHDL files."""
 
-    def __init__(self) -> None:
+    def __init__(self, naming: Naming | None = None) -> None:
+        self.naming = naming or Naming()
         self.records: dict[str, RecordDef] = {}   # keyed by lowercase name
         self.decls: dict[str, _TypeDecl] = {}     # keyed by lowercase name
         self.packages: list[str] = []
@@ -134,14 +165,14 @@ class VhdlSource:
             if name not in self.packages:
                 self.packages.append(name)
 
-        for regex, kind in ((_RE_ARRAY, "array"), (_RE_ENUM, "enum")):
-            for m in regex.finditer(text):
-                self._add_decl(_TypeDecl(kind, m.group(1), source=source,
-                                         line=_line_of(text, m.start())))
+        for m in _RE_ENUM.finditer(text):
+            self._add_decl(_TypeDecl("enum", m.group(1), source=source,
+                                     line=_line_of(text, m.start())))
         for m in _RE_SUBTYPE.finditer(text):
             self._add_decl(_TypeDecl("subtype", m.group(1), payload=m.group(2),
                                      source=source,
                                      line=_line_of(text, m.start())))
+        self._parse_arrays(text, source)
 
         for m in _RE_RECORD.finditer(text):
             name = m.group(1)
@@ -166,8 +197,60 @@ class VhdlSource:
             self.order.append(name)
             rec.fields = self._parse_body(rec, text[m.end():end.start()], line)
 
+        self._link_vector_types()
+
+    def _parse_arrays(self, text: str, source: str) -> None:
+        for m in _RE_ARRAY_HEAD.finditer(text):
+            name = m.group(1)
+            line = _line_of(text, m.start())
+            open_at = m.end() - 1
+            close = _matching_paren(text, open_at)
+            if close < 0:
+                raise VhdlSerdesError(
+                    f"{source}:{line}: parenthese non fermee dans la "
+                    f"declaration du tableau '{name}'")
+            index_text = text[open_at + 1:close]
+            tail = _RE_ARRAY_TAIL.match(text, close + 1)
+            if tail is None:
+                raise VhdlSerdesError(
+                    f"{source}:{line}: declaration du tableau '{name}' "
+                    f"illisible, attendu '... ) of <type>;'")
+            self._add_decl(_TypeDecl(
+                "array", name,
+                payload=tail.group(1).strip(),
+                index_text=index_text.strip(),
+                unconstrained="<>" in index_text,
+                multi_dim=len(_split_top_level(index_text, ",")) > 1,
+                source=source, line=line))
+
     def _add_decl(self, decl: _TypeDecl) -> None:
         self.decls.setdefault(decl.name.lower(), decl)
+
+    def _link_vector_types(self) -> None:
+        """Attach to each record the array type declared over it, if any."""
+        preferred = {rec.name.lower(): self.naming.vector_type(rec.name).lower()
+                     for rec in self.records.values()}
+        for decl in self.decls.values():
+            if decl.kind != "array" or decl.multi_dim:
+                continue
+            kept = len(self.warnings)
+            try:
+                element = self._resolve(decl.payload,
+                                        f"{decl.source}:{decl.line}")
+            except VhdlSerdesError:
+                continue
+            finally:
+                del self.warnings[kept:]  # no field uses it yet: stay quiet
+            if element.kind is not FieldKind.RECORD or not element.record_type:
+                continue
+            rec = self.records.get(element.record_type.lower())
+            if rec is None:
+                continue
+            wanted = preferred.get(rec.name.lower())
+            if rec.vector is None or (decl.name.lower() == wanted
+                                      and rec.vector.name.lower() != wanted):
+                rec.vector = VectorType(decl.name, decl.unconstrained,
+                                        decl.source, decl.line)
 
     def _parse_body(self, rec: RecordDef, body: str, base_line: int) -> list[Field]:
         fields: list[Field] = []
@@ -206,13 +289,15 @@ class VhdlSource:
     def _make_field(self, rec: RecordDef, name: str, type_text: str,
                     line: int) -> Field:
         where = f"{rec.source}:{line}: {rec.name}.{name}"
-        kind, base, width, record_type, external = self._resolve(type_text, where)
-        return Field(name=name, kind=kind, type_name=" ".join(type_text.split()),
-                     width=width, base_type=base, record_type=record_type,
-                     external=external, line=line)
+        res = self._resolve(type_text, where)
+        return Field(name=name, kind=res.kind,
+                     type_name=" ".join(type_text.split()),
+                     width=res.width, base_type=res.base_type,
+                     record_type=res.record_type, external=res.external,
+                     line=line, array=res.array)
 
-    def _resolve(self, type_text: str, where: str, _seen: tuple[str, ...] = ()
-                 ) -> tuple[FieldKind, str, Width, str | None, bool]:
+    def _resolve(self, type_text: str, where: str,
+                 _seen: tuple[str, ...] = ()) -> _Resolved:
         text = " ".join(type_text.split())
         m = re.fullmatch(r"([A-Za-z]\w*(?:\s*\.\s*[A-Za-z]\w*)*)\s*(?:\((.*)\))?",
                          text, re.S)
@@ -225,19 +310,18 @@ class VhdlSource:
             if range_text:
                 raise VhdlSerdesError(
                     f"{where}: '{simple}' ne prend pas d'intervalle")
-            return FieldKind.STD_LOGIC, simple, Width.static(1), None, False
+            return _Resolved(FieldKind.STD_LOGIC, simple, Width.static(1))
 
-        for names, kind in (
-            (_SLV_TYPES, FieldKind.STD_LOGIC_VECTOR),
-            (_UNSIGNED_TYPES, FieldKind.UNSIGNED),
-            (_SIGNED_TYPES, FieldKind.SIGNED),
-        ):
+        for names, kind in ((_SLV_TYPES, FieldKind.STD_LOGIC_VECTOR),
+                            (_UNSIGNED_TYPES, FieldKind.UNSIGNED),
+                            (_SIGNED_TYPES, FieldKind.SIGNED)):
             if simple in names:
                 if not range_text:
                     raise VhdlSerdesError(
                         f"{where}: '{simple}' non contraint, precisez un "
                         f"intervalle (ex: {simple}(7 downto 0))")
-                return kind, simple, _range_width(range_text, where), None, False
+                width, _ = _range_width(range_text, where)
+                return _Resolved(kind, simple, width)
 
         if simple in _UNSUPPORTED_SCALARS:
             raise VhdlSerdesError(
@@ -248,39 +332,123 @@ class VhdlSource:
         if decl is not None and decl.kind == "record":
             if range_text:
                 raise VhdlSerdesError(
-                    f"{where}: un record ne prend pas d'intervalle")
-            return FieldKind.RECORD, decl.name, Width(), decl.name, False
-        if decl is not None and decl.kind in ("array", "enum"):
-            what = "tableau" if decl.kind == "array" else "type enumere"
+                    f"{where}: un record ne prend pas d'intervalle directement ; "
+                    f"pour un tableau de records, declarez 'type "
+                    f"{self.naming.vector_type(decl.name)} is array (natural "
+                    f"range <>) of {decl.name};'")
+            return _Resolved(FieldKind.RECORD, decl.name, Width(),
+                             record_type=decl.name)
+        if decl is not None and decl.kind == "enum":
             raise VhdlSerdesError(
-                f"{where}: '{decl.name}' est un {what} "
+                f"{where}: '{decl.name}' est un type enumere "
                 f"({decl.source}:{decl.line}), non supporte")
+        if decl is not None and decl.kind == "array":
+            return self._resolve_array(decl, range_text, where, _seen)
         if decl is not None and decl.kind == "subtype":
             if simple in _seen:
                 raise VhdlSerdesError(
                     f"{where}: resolution circulaire du subtype '{decl.name}'")
-            kind, mark, width, rec_type, ext = self._resolve(
-                decl.payload, where, _seen + (simple,))
-            if range_text:  # subtype of an unconstrained type, constrained here
-                width = _range_width(range_text, where)
-            return kind, mark, width, rec_type, ext
+            res = self._resolve(decl.payload, where, _seen + (simple,))
+            if range_text and not res.kind.is_array:
+                # subtype of an unconstrained vector type, constrained here
+                width, _ = _range_width(range_text, where)
+                res = _Resolved(res.kind, res.base_type, width,
+                                res.record_type, res.external)
+            return res
+
+        # Unknown type mark following the vector convention: a record array
+        # declared elsewhere.
+        if range_text and self.naming.is_vector_type_name(simple):
+            count, descending = _range_width(range_text, where)
+            base = self.naming.base_of_vector_type(full_name.split(".")[-1])
+            self.warnings.append(
+                f"{where}: type '{full_name}' inconnu, suppose etre un tableau "
+                f"de records '{base}' fournissant les fonctions de la meme "
+                f"convention de nommage")
+            return _Resolved(
+                FieldKind.RECORD_VECTOR, full_name, Width(), external=True,
+                array=ArrayInfo(vector_type=full_name,
+                                element_kind=FieldKind.RECORD,
+                                count=count, descending=descending))
 
         # Unknown type mark: assume a record declared elsewhere that follows the
         # same naming convention (documented behaviour).
         if range_text:
             raise VhdlSerdesError(
-                f"{where}: type inconnu '{full_name}' avec un intervalle; "
-                f"un record externe ne prend pas d'intervalle")
+                f"{where}: type inconnu '{full_name}' avec un intervalle ; un "
+                f"record externe ne prend pas d'intervalle, et un tableau "
+                f"externe doit suivre la convention "
+                f"'<nom>_{self.naming.vector_suffix}'")
         self.warnings.append(
             f"{where}: type '{full_name}' inconnu, suppose etre un record "
             f"fournissant les fonctions de la meme convention de nommage")
-        return FieldKind.RECORD, full_name, Width(), full_name, True
+        return _Resolved(FieldKind.RECORD, full_name, Width(),
+                         record_type=full_name, external=True)
+
+    def _resolve_array(self, decl: _TypeDecl, range_text: str | None,
+                       where: str, _seen: tuple[str, ...]) -> _Resolved:
+        if decl.multi_dim:
+            raise VhdlSerdesError(
+                f"{where}: '{decl.name}' est un tableau multidimensionnel "
+                f"({decl.source}:{decl.line}), non supporte")
+        if range_text and not decl.unconstrained:
+            raise VhdlSerdesError(
+                f"{where}: le type tableau '{decl.name}' est deja contraint "
+                f"({decl.source}:{decl.line}), retirez l'intervalle")
+        if not range_text and decl.unconstrained:
+            raise VhdlSerdesError(
+                f"{where}: '{decl.name}' non contraint, precisez un intervalle "
+                f"(ex: {decl.name}(0 to 3))")
+        count, descending = _range_width(
+            range_text if range_text else _index_range(decl.index_text), where)
+
+        if decl.name.lower() in _seen:
+            raise VhdlSerdesError(
+                f"{where}: resolution circulaire du tableau '{decl.name}'")
+        element = self._resolve(decl.payload, where, _seen + (decl.name.lower(),))
+        if element.kind.is_array:
+            raise VhdlSerdesError(
+                f"{where}: '{decl.name}' est un tableau de tableaux "
+                f"({decl.source}:{decl.line}), non supporte")
+
+        if element.kind is FieldKind.RECORD:
+            kind = FieldKind.RECORD_VECTOR
+            if element.record_type:
+                expected = self.naming.vector_type(element.record_type)
+                if decl.name.lower() != expected.lower():
+                    self.warnings.append(
+                        f"{decl.source}:{decl.line}: le tableau de "
+                        f"'{element.record_type}' est nomme '{decl.name}' et "
+                        f"non '{expected}' comme l'attend la convention ; les "
+                        f"fonctions generees prennent bien '{decl.name}'")
+        else:
+            kind = FieldKind.SCALAR_VECTOR
+
+        return _Resolved(
+            kind, element.base_type, Width(),
+            record_type=element.record_type, external=element.external,
+            array=ArrayInfo(vector_type=decl.name,
+                            element_kind=element.kind,
+                            element_base_type=element.base_type,
+                            element_width=element.width,
+                            element_record=element.record_type,
+                            count=count, descending=descending,
+                            type_unconstrained=decl.unconstrained))
 
 
-def _range_width(range_text: str, where: str) -> Width:
+def _index_range(index_text: str) -> str:
+    """``natural range 0 to 3`` -> ``0 to 3``."""
+    pos = _find_top_level(index_text, r"\brange\b")
+    return index_text[pos + len("range"):] if pos >= 0 else index_text
+
+
+def _range_width(range_text: str, where: str) -> tuple[Width, bool]:
+    """Number of values in a VHDL range, and whether it runs 'downto'."""
     text = " ".join(range_text.split())
+    descending = False
     down = _find_top_level(text, r"\bdownto\b")
     if down >= 0:
+        descending = True
         high, low = text[:down].strip(), text[down + len("downto"):].strip()
     else:
         to = _find_top_level(text, r"\bto\b")
@@ -291,28 +459,29 @@ def _range_width(range_text: str, where: str) -> Width:
         low, high = text[:to].strip(), text[to + len("to"):].strip()
     if not high or not low:
         raise VhdlSerdesError(f"{where}: intervalle incomplet '({range_text})'")
+
     hi_val, lo_val = eval_static(high), eval_static(low)
     if hi_val is not None and lo_val is not None:
-        width = hi_val - lo_val + 1
-        if width <= 0:
+        count = hi_val - lo_val + 1
+        if count <= 0:
             raise VhdlSerdesError(f"{where}: intervalle vide '({range_text})'")
-        return Width.static(width)
+        return Width.static(count), descending
     if lo_val == 0:
-        return Width.symbolic(f"(({high}) + 1)")
+        return Width.symbolic(f"(({high}) + 1)"), descending
     if lo_val is not None:
         sign = "-" if lo_val > 1 else "+"
-        return Width.symbolic(f"(({high}) {sign} {abs(lo_val - 1)})")
+        return Width.symbolic(f"(({high}) {sign} {abs(lo_val - 1)})"), descending
     if hi_val is not None:
-        return Width.symbolic(f"({hi_val + 1} - ({low}))")
-    return Width.symbolic(f"(({high}) - ({low}) + 1)")
+        return Width.symbolic(f"({hi_val + 1} - ({low}))"), descending
+    return Width.symbolic(f"(({high}) - ({low}) + 1)"), descending
 
 
 def _line_of(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
-def parse_files(paths: list) -> VhdlSource:
-    src = VhdlSource()
+def parse_files(paths: list, naming: Naming | None = None) -> VhdlSource:
+    src = VhdlSource(naming)
     for p in paths:
         src.add_file(p)
     return src

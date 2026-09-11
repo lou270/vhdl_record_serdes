@@ -6,9 +6,9 @@ import argparse
 import sys
 from pathlib import Path
 
-from .generator import (GenOptions, generate, layout, record_width,
-                        sort_records, static_sizes)
-from .model import (DEFAULT_TYPE_SUFFIXES, Naming, RecordDef,
+from .generator import (GenOptions, element_base, generate, layout,
+                        record_width, sort_records, static_sizes)
+from .model import (DEFAULT_TYPE_SUFFIXES, FieldKind, Naming, RecordDef,
                     VhdlSerdesError)
 from .parser import VhdlSource
 
@@ -71,6 +71,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--deserialize-suffix", default="slv2record", metavar="SUFF",
                    help="suffixe de la fonction de deserialisation "
                         "(defaut: slv2record)")
+    g.add_argument("--vector-suffix", default="vector", metavar="SUFF",
+                   help="suffixe du type tableau associe a un record "
+                        "(defaut: vector, soit <base>_vector)")
+    g.add_argument("--serialize-vector-suffix", default="recordvector2slv",
+                   metavar="SUFF",
+                   help="suffixe de la fonction de serialisation de tableau "
+                        "(defaut: recordvector2slv)")
+    g.add_argument("--deserialize-vector-suffix", default="slv2recordvector",
+                   metavar="SUFF",
+                   help="suffixe de la fonction de deserialisation de tableau "
+                        "(defaut: slv2recordvector)")
 
     g = p.add_argument_group("code genere")
     g.add_argument("--library", default="work", metavar="LIB",
@@ -144,6 +155,11 @@ def _describe(records: list[RecordDef], naming: Naming) -> str:
         out.append(f"    {naming.width_const(rec.name)}")
         out.append(f"    {naming.serialize_fn(rec.name)} / "
                    f"{naming.deserialize_fn(rec.name)}")
+        if rec.vector is not None:
+            base = naming.base(rec.name)
+            out.append(f"    {naming.serialize_vector_fn_of(base)} / "
+                       f"{naming.deserialize_vector_fn_of(base)}"
+                       f"   (sur {rec.vector.name})")
         for fld, low, high in layout(rec, sizes):
             pos = (f"[{high:>4} : {low:>4}]" if low is not None and high is not None
                    else "[  dynamique  ]")
@@ -171,10 +187,13 @@ def main(argv: list[str] | None = None) -> int:
         width_suffix=args.width_suffix,
         ser_suffix=args.serialize_suffix,
         deser_suffix=args.deserialize_suffix,
+        vector_suffix=args.vector_suffix,
+        ser_vector_suffix=args.serialize_vector_suffix,
+        deser_vector_suffix=args.deserialize_vector_suffix,
     )
 
     try:
-        src = VhdlSource()
+        src = VhdlSource(naming)
         for path in args.inputs:
             src.add_file(path)
         if not src.records:
@@ -189,6 +208,21 @@ def main(argv: list[str] | None = None) -> int:
                     f"{rec.source}:{rec.line}: '{rec.name}' n'est pas declare "
                     f"dans un package ; le type ne sera pas visible depuis le "
                     f"package genere (deplacez-le ou ajoutez --use)")
+
+        bases = {naming.base(rec.name).lower(): rec for rec in records}
+        for rec in records:
+            for fld in rec.fields:
+                if fld.kind is not FieldKind.RECORD_VECTOR or not fld.external:
+                    continue
+                target = bases.get(element_base(fld, naming).lower())
+                if target is not None and target.vector is None:
+                    src.warnings.append(
+                        f"{rec.source}:{fld.line}: le type tableau "
+                        f"'{fld.array.vector_type}' n'est declare dans aucun "
+                        f"fichier d'entree ; declarez 'type "
+                        f"{naming.vector_type(target.name)} is array (natural "
+                        f"range <>) of {target.name};' pour que ses fonctions "
+                        f"vectorielles soient generees ici")
 
         for warning in src.warnings:
             print(f"avertissement: {warning}", file=sys.stderr)

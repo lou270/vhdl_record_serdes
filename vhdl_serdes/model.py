@@ -65,6 +65,12 @@ class Width:
             parts.append(str(self.const))
         return " + ".join(parts)
 
+    def times(self, count: "Width") -> "Width":
+        """``count`` elements of this width, kept numeric when both are static."""
+        if self.is_static and count.is_static:
+            return Width.static(self.const * count.const)
+        return Width.symbolic(f"({count.render()} * {self.render()})")
+
     @classmethod
     def static(cls, value: int) -> "Width":
         return cls(const=value)
@@ -80,10 +86,34 @@ class FieldKind(Enum):
     UNSIGNED = "unsigned"
     SIGNED = "signed"
     RECORD = "record"
+    RECORD_VECTOR = "record_vector"    # array of records
+    SCALAR_VECTOR = "scalar_vector"    # array of std_logic / slv / unsigned / signed
 
     @property
-    def is_vector(self) -> bool:
-        return self is not FieldKind.STD_LOGIC
+    def is_single_bit(self) -> bool:
+        return self is FieldKind.STD_LOGIC
+
+    @property
+    def is_array(self) -> bool:
+        return self in (FieldKind.RECORD_VECTOR, FieldKind.SCALAR_VECTOR)
+
+
+@dataclass
+class ArrayInfo:
+    """An array-typed record element.
+
+    Elements are packed lowest index first: the element with the smallest index
+    occupies the least significant bits, whichever way the range runs.
+    """
+
+    vector_type: str                  # array type mark, as written in the record
+    element_kind: FieldKind
+    element_base_type: str = ""
+    element_width: Width = dc_field(default_factory=Width)
+    element_record: str | None = None  # element record type, when known
+    count: Width = dc_field(default_factory=Width)
+    descending: bool = False           # the field range runs 'downto'
+    type_unconstrained: bool = True    # the array TYPE is 'array (... range <>)'
 
 
 @dataclass
@@ -93,10 +123,21 @@ class Field:
     name: str
     kind: FieldKind
     type_name: str                  # type mark as written in the source
-    width: Width
+    width: Width = dc_field(default_factory=Width)
     base_type: str = ""             # resolved base type mark (for casts)
-    record_type: str | None = None  # nested record type name
-    external: bool = False          # nested record not present in the inputs
+    record_type: str | None = None  # record type, directly or as array element
+    external: bool = False          # that record is not present in the inputs
+    line: int = 0
+    array: ArrayInfo | None = None  # set for the array kinds
+
+
+@dataclass
+class VectorType:
+    """The array type declared for a record, following the naming convention."""
+
+    name: str
+    unconstrained: bool = True
+    source: str = ""
     line: int = 0
 
 
@@ -109,10 +150,11 @@ class RecordDef:
     package: str | None = None
     source: str = ""
     line: int = 0
+    vector: VectorType | None = None  # array type of this record, if any
 
     @property
     def dependencies(self) -> list[str]:
-        """Nested record types declared in the same input set."""
+        """Record types used by this record and declared in the same inputs."""
         return [f.record_type for f in self.fields
                 if f.record_type and not f.external]
 
@@ -135,6 +177,9 @@ class Naming:
     width_suffix: str = "SERIALIZED_WIDTH"
     ser_suffix: str = "record2slv"
     deser_suffix: str = "slv2record"
+    vector_suffix: str = "vector"
+    ser_vector_suffix: str = "recordvector2slv"
+    deser_vector_suffix: str = "slv2recordvector"
 
     def base(self, type_name: str) -> str:
         """Name kept from a record type: only the head, without its type tag.
@@ -155,14 +200,48 @@ class Naming:
                 break
         return name
 
+    # -- identifiers built from a record type name -------------------------
     def width_const(self, type_name: str) -> str:
-        return f"{self.base(type_name).upper()}_{self.width_suffix}"
+        return self.width_const_of(self.base(type_name))
 
     def serialize_fn(self, type_name: str) -> str:
-        return f"{self.base(type_name)}_{self.ser_suffix}"
+        return self.serialize_fn_of(self.base(type_name))
 
     def deserialize_fn(self, type_name: str) -> str:
-        return f"{self.base(type_name)}_{self.deser_suffix}"
+        return self.deserialize_fn_of(self.base(type_name))
+
+    def vector_type(self, type_name: str) -> str:
+        """Array type expected for a record: ``frame_t`` -> ``frame_vector``."""
+        return f"{self.base(type_name)}_{self.vector_suffix}"
 
     def bound_const(self, type_name: str, field: str, bound: str) -> str:
         return f"{self.base(type_name).upper()}_{field.upper()}_{bound}"
+
+    # -- identifiers built from an already stripped base name --------------
+    def width_const_of(self, base: str) -> str:
+        return f"{base.upper()}_{self.width_suffix}"
+
+    def serialize_fn_of(self, base: str) -> str:
+        return f"{base}_{self.ser_suffix}"
+
+    def deserialize_fn_of(self, base: str) -> str:
+        return f"{base}_{self.deser_suffix}"
+
+    def serialize_vector_fn_of(self, base: str) -> str:
+        return f"{base}_{self.ser_vector_suffix}"
+
+    def deserialize_vector_fn_of(self, base: str) -> str:
+        return f"{base}_{self.deser_vector_suffix}"
+
+    def base_of_vector_type(self, vector_type_name: str) -> str:
+        """``frame_vector`` -> ``frame``; any other name is returned as is."""
+        tail = f"_{self.vector_suffix}"
+        if (len(vector_type_name) > len(tail)
+                and vector_type_name.lower().endswith(tail.lower())):
+            return vector_type_name[: -len(tail)]
+        return vector_type_name
+
+    def is_vector_type_name(self, type_name: str) -> bool:
+        tail = f"_{self.vector_suffix}"
+        return (len(type_name) > len(tail)
+                and type_name.lower().endswith(tail.lower()))

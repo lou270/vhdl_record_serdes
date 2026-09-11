@@ -25,6 +25,11 @@ package example_pkg is
     valid   : std_logic;
   end record header_t;
 
+  -- Tableau de records : le nom suit la convention <base>_vector
+  type header_vector is array (natural range <>) of header_t;
+  -- Tableau d'elements scalaires : serialise element par element
+  type byte_vector is array (natural range <>) of byte_t;
+
   -- Trame complete : largeur dependant d'une constante
   type frame_t is record
     hdr    : header_t;
@@ -32,5 +37,12 @@ package example_pkg is
     offset : signed(11 downto 0);
     last   : std_logic;
   end record frame_t;
+
+  -- Rafale : deux entetes et quatre octets de bourrage
+  type burst_t is record
+    headers : header_vector(0 to 1);
+    padding : byte_vector(0 to 3);
+    count   : unsigned(7 downto 0);
+  end record burst_t;
 
 end package example_pkg;

@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from vhdl_serdes import FieldKind, GenOptions, Naming, VhdlSerdesError, generate
 from vhdl_serdes.cli import main
-from vhdl_serdes.generator import layout, record_width, sort_records, static_sizes
+from vhdl_serdes.generator import (element_base, field_width, layout,
+                                   record_width, sort_records, static_sizes)
 from vhdl_serdes.parser import VhdlSource, strip_comments
 
 SIMPLE = """
@@ -124,8 +125,11 @@ class TestParser(unittest.TestCase):
         for snippet in ("type t is record n : integer; end record;",
                         "type t is record f : boolean; end record;",
                         "type e is (a, b); type t is record s : e; end record;",
-                        "type arr is array (0 to 3) of std_logic;"
-                        " type t is record s : arr; end record;",
+                        "type grid is array (0 to 1, 0 to 2) of std_logic;"
+                        " type t is record s : grid; end record;",
+                        "type row is array (natural range <>) of std_logic;"
+                        " type grid is array (natural range <>) of row(0 to 3);"
+                        " type t is record s : grid(0 to 1); end record;",
                         "type t is record d : std_logic_vector; end record;"):
             with self.subTest(snippet=snippet):
                 with self.assertRaises(VhdlSerdesError):
@@ -183,6 +187,178 @@ class TestLayout(unittest.TestCase):
         src.records["a_t"].fields[0].record_type = "b_t"
         with self.assertRaises(VhdlSerdesError):
             sort_records([src.records["a_t"], src.records["b_t"]])
+
+
+ARRAYS = """
+package p_pkg is
+  type coord_t is record
+    x : signed(11 downto 0);
+    y : signed(11 downto 0);
+  end record coord_t;
+
+  type coord_vector is array (natural range <>) of coord_t;
+  type byte_vector  is array (natural range <>) of std_logic_vector(7 downto 0);
+  type flag_vector  is array (natural range <>) of std_logic;
+
+  type blob_t is record
+    corners : coord_vector(0 to 3);
+    mask    : byte_vector(0 to 1);
+    flags   : flag_vector(0 to 2);
+    alive   : std_logic;
+  end record blob_t;
+end package p_pkg;
+"""
+
+
+class TestArrayFields(unittest.TestCase):
+    def test_kinds_and_counts(self):
+        blob = parse(ARRAYS).records["blob_t"]
+        self.assertEqual([f.kind for f in blob.fields],
+                         [FieldKind.RECORD_VECTOR, FieldKind.SCALAR_VECTOR,
+                          FieldKind.SCALAR_VECTOR, FieldKind.STD_LOGIC])
+        corners, mask, flags, _ = blob.fields
+        self.assertEqual(corners.array.count.const, 4)
+        self.assertEqual(corners.array.element_record, "coord_t")
+        self.assertEqual(corners.array.vector_type, "coord_vector")
+        self.assertFalse(corners.array.descending)
+        self.assertEqual(mask.array.element_width.const, 8)
+        self.assertEqual(flags.array.element_width.const, 1)
+        self.assertEqual(blob.dependencies, ["coord_t"])
+
+    def test_widths_and_layout(self):
+        src = parse(ARRAYS)
+        records = [src.records["coord_t"], src.records["blob_t"]]
+        sizes = static_sizes(records)
+        self.assertEqual(sizes["blob_t"], 4 * 24 + 2 * 8 + 3 + 1)
+        rows = layout(src.records["blob_t"], sizes)
+        self.assertEqual([(f.name, lo, hi) for f, lo, hi in rows],
+                         [("corners", 0, 95), ("mask", 96, 111),
+                          ("flags", 112, 114), ("alive", 115, 115)])
+
+    def test_symbolic_count(self):
+        rec = parse("type coord_t is record x : std_logic; end record;"
+                    "type coord_vector is array (natural range <>) of coord_t;"
+                    "type t is record c : coord_vector(0 to N - 1); "
+                    "end record;").records["t"]
+        self.assertEqual(field_width(rec.fields[0], Naming()).render(),
+                         "(((N - 1) + 1) * COORD_SERIALIZED_WIDTH)")
+
+    def test_descending_range(self):
+        rec = parse("type coord_t is record x : std_logic; end record;"
+                    "type coord_vector is array (natural range <>) of coord_t;"
+                    "type t is record c : coord_vector(3 downto 0); "
+                    "end record;").records["t"]
+        self.assertTrue(rec.fields[0].array.descending)
+        self.assertEqual(rec.fields[0].array.count.const, 4)
+
+    def test_constrained_array_type(self):
+        src = parse("type coord_t is record x : std_logic; end record;"
+                    "type coord_vector is array (0 to 3) of coord_t;"
+                    "type t is record c : coord_vector; end record;")
+        info = src.records["t"].fields[0].array
+        self.assertEqual(info.count.const, 4)
+        self.assertFalse(info.type_unconstrained)
+        self.assertFalse(src.records["coord_t"].vector.unconstrained)
+
+    def test_range_errors(self):
+        base = ("type coord_t is record x : std_logic; end record;"
+                "type coord_vector is array (%s) of coord_t;"
+                "type t is record c : coord_vector%s; end record;")
+        with self.assertRaises(VhdlSerdesError):   # already constrained
+            parse(base % ("0 to 3", "(0 to 3)"))
+        with self.assertRaises(VhdlSerdesError):   # still unconstrained
+            parse(base % ("natural range <>", ""))
+
+    def test_record_with_a_range_is_refused_with_a_hint(self):
+        with self.assertRaises(VhdlSerdesError) as ctx:
+            parse("type coord_t is record x : std_logic; end record;"
+                  "type t is record c : coord_t(0 to 3); end record;")
+        self.assertIn("coord_vector", str(ctx.exception))
+
+    def test_external_vector_follows_the_convention(self):
+        src = parse("type t is record c : payload_vector(0 to 7); end record;")
+        fld = src.records["t"].fields[0]
+        self.assertEqual(fld.kind, FieldKind.RECORD_VECTOR)
+        self.assertTrue(fld.external)
+        self.assertEqual(fld.array.count.const, 8)
+        self.assertEqual(element_base(fld, Naming()), "payload")
+        self.assertEqual(len(src.warnings), 1)
+
+    def test_vector_type_linked_to_its_record(self):
+        src = parse(ARRAYS)
+        self.assertEqual(src.records["coord_t"].vector.name, "coord_vector")
+        self.assertTrue(src.records["coord_t"].vector.unconstrained)
+        self.assertIsNone(src.records["blob_t"].vector)
+
+    def test_off_convention_vector_name_warns(self):
+        src = parse("type coord_t is record x : std_logic; end record;"
+                    "type coord_array_t is array (natural range <>) of coord_t;"
+                    "type t is record c : coord_array_t(0 to 1); end record;")
+        self.assertEqual(len(src.warnings), 1)
+        self.assertIn("coord_vector", src.warnings[0])
+        # the functions still take the type that actually exists
+        self.assertEqual(src.records["t"].fields[0].array.vector_type,
+                         "coord_array_t")
+
+
+class TestArrayGeneration(unittest.TestCase):
+    def test_vector_functions_declared(self):
+        code = gen(ARRAYS)
+        self.assertIn("function coord_recordvector2slv (value : coord_vector) "
+                      "return std_logic_vector;", code)
+        self.assertIn("function coord_slv2recordvector (data : std_logic_vector) "
+                      "return coord_vector;", code)
+        # blob_t has no array type of its own
+        self.assertNotIn("blob_recordvector2slv", code)
+
+    def test_record_array_field_uses_the_vector_functions(self):
+        code = gen(ARRAYS)
+        self.assertIn("coord_recordvector2slv(value.corners)", code)
+        self.assertIn("coord_slv2recordvector(src(BLOB_CORNERS_HIGH downto "
+                      "BLOB_CORNERS_LOW))", code)
+        self.assertIn("constant BLOB_SERIALIZED_WIDTH : natural := "
+                      "(4 * COORD_SERIALIZED_WIDTH) + 16 + 3 + 1;", code)
+
+    def test_vector_functions_pack_lowest_index_first(self):
+        code = gen(ARRAYS)
+        self.assertIn("element_low := (i - value'low) * "
+                      "COORD_SERIALIZED_WIDTH;", code)
+        self.assertIn("element_low := (i - result'low) * "
+                      "COORD_SERIALIZED_WIDTH;", code)
+
+    def test_scalar_array_loops(self):
+        code = gen(ARRAYS)
+        self.assertIn("for i in value.mask'range loop", code)
+        self.assertIn("element_low := BLOB_MASK_LOW + "
+                      "(i - value.mask'low) * 8;", code)
+        self.assertIn("result(element_low + 7 downto element_low) := "
+                      "value.mask(i);", code)
+        self.assertIn("result.mask(i) := src(element_low + 7 downto "
+                      "element_low);", code)
+        # single-bit elements need no stride multiplication
+        self.assertIn("element_low := BLOB_FLAGS_LOW + "
+                      "(i - value.flags'low);", code)
+        self.assertIn("result(element_low) := value.flags(i);", code)
+
+    def test_descending_field_keeps_index_order(self):
+        code = gen("type coord_t is record x : std_logic; end record;"
+                   "type coord_vector is array (natural range <>) of coord_t;"
+                   "type t is record c : coord_vector(3 downto 0); end record;")
+        self.assertRegex(code, r"variable c_v\s+: coord_vector\(0 to 3\);")
+        self.assertIn("c_v := coord_slv2recordvector(", code)
+        self.assertIn("result.c(i) := c_v(i - result.c'low);", code)
+
+    def test_constrained_vector_type_bodies(self):
+        code = gen("type coord_t is record x : std_logic; end record;"
+                   "type coord_vector is array (0 to 3) of coord_t;"
+                   "type t is record c : coord_vector; end record;")
+        self.assertRegex(code, r"variable result\s+: coord_vector;")
+        self.assertNotIn("constant COUNT", code)
+        self.assertIn("assert data'length = result'length * "
+                      "COORD_SERIALIZED_WIDTH", code)
+
+    def test_generated_code_stays_ascii(self):
+        gen(ARRAYS).encode("ascii")
 
 
 class TestNaming(unittest.TestCase):
@@ -388,6 +564,27 @@ class TestCli(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("function frame_record2slv (value : frame_rec)", out)
         self.assertIn("constant FRAME_SERIALIZED_WIDTH", out)
+
+    def test_list_shows_vector_functions(self):
+        path = Path(self.tmp.name) / "vec_pkg.vhd"
+        path.write_text(ARRAYS, encoding="utf-8")
+        rc, out, _ = self._run([str(path), "--list"])
+        self.assertEqual(rc, 0)
+        self.assertIn("coord_recordvector2slv / coord_slv2recordvector", out)
+        self.assertIn("(sur coord_vector)", out)
+
+    def test_missing_vector_type_is_reported(self):
+        path = Path(self.tmp.name) / "miss_pkg.vhd"
+        path.write_text("package miss_pkg is "
+                        "type coord_t is record x : std_logic; end record;"
+                        "type t is record c : coord_vector(0 to 1); end record;"
+                        "end package;", encoding="utf-8")
+        rc, out, err = self._run([str(path)])
+        self.assertEqual(rc, 0)
+        self.assertIn("coord_recordvector2slv", out)  # assumed to exist
+        self.assertIn("n'est declare dans aucun fichier", err)
+        self.assertIn("type coord_vector is array (natural range <>) of "
+                      "coord_t;", err)
 
     def test_missing_file(self):
         rc, _, err = self._run(["nope.vhd"])

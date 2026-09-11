@@ -1,7 +1,8 @@
 """VHDL code generation: one package + one package body for a set of records.
 
-Packing convention: the first field declared sits on the least significant bits
-(offset 0), the last field on the most significant bits.
+Packing conventions: the first field declared sits on the least significant
+bits, the last field on the most significant ones; inside an array field, the
+element with the lowest index sits on the least significant bits.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from dataclasses import dataclass, field as dc_field
 from .model import Field, FieldKind, Naming, RecordDef, VhdlSerdesError, Width
 
 IND = "  "
+OFFSET_VAR = "element_low"
 
 
 @dataclass
@@ -28,6 +30,26 @@ class GenOptions:
 # --------------------------------------------------------------------------
 # width / layout helpers
 # --------------------------------------------------------------------------
+def element_base(fld: Field, naming: Naming) -> str:
+    """Generated base name of the record a field is made of."""
+    info = fld.array
+    if info is not None:
+        if info.element_record:
+            return naming.base(info.element_record)
+        return naming.base_of_vector_type(info.vector_type)
+    return naming.base(fld.record_type or "")
+
+
+def element_width(fld: Field, naming: Naming) -> Width:
+    """Width of one array element."""
+    info = fld.array
+    if info is None:
+        raise VhdlSerdesError(f"le champ '{fld.name}' n'est pas un tableau")
+    if info.element_kind is FieldKind.RECORD:
+        return Width.symbolic(naming.width_const_of(element_base(fld, naming)))
+    return info.element_width
+
+
 def field_width(fld: Field, naming: Naming) -> Width:
     """Width of one field, nested records expressed through their constant.
 
@@ -37,6 +59,8 @@ def field_width(fld: Field, naming: Naming) -> Width:
     """
     if fld.kind is FieldKind.RECORD:
         return Width.symbolic(naming.width_const(fld.record_type))
+    if fld.kind.is_array:
+        return element_width(fld, naming).times(fld.array.count)
     return fld.width
 
 
@@ -55,6 +79,16 @@ def field_bits(fld: Field, sizes: dict[str, int]) -> int | None:
     """Numeric width of a field, or None when only the VHDL tool can know it."""
     if fld.kind is FieldKind.RECORD:
         return sizes.get((fld.record_type or "").lower())
+    if fld.kind.is_array:
+        info = fld.array
+        if not info.count.is_static:
+            return None
+        if info.element_kind is FieldKind.RECORD:
+            bits = sizes.get((info.element_record or "").lower())
+        else:
+            bits = (info.element_width.const if info.element_width.is_static
+                    else None)
+        return None if bits is None else bits * info.count.const
     return fld.width.const if fld.width.is_static else None
 
 
@@ -125,10 +159,32 @@ def sort_records(records: list[RecordDef]) -> list[RecordDef]:
 # --------------------------------------------------------------------------
 def _slice_of(fld: Field, rec: RecordDef, naming: Naming, signal: str) -> str:
     low = naming.bound_const(rec.name, fld.name, "LOW")
-    if fld.kind is FieldKind.STD_LOGIC:
+    if fld.kind.is_single_bit:
         return f"{signal}({low})"
     high = naming.bound_const(rec.name, fld.name, "HIGH")
     return f"{signal}({high} downto {low})"
+
+
+def _span(low: str, width: Width) -> str:
+    """``low + w - 1 downto low``, kept short when the width is static."""
+    if width.is_static:
+        top = low if width.const == 1 else f"{low} + {width.const - 1}"
+    else:
+        top = f"{low} + {width.render()} - 1"
+    return f"{top} downto {low}"
+
+
+def _as_slv(expr: str, kind: FieldKind, base_type: str) -> str:
+    """Wrap ``expr`` in a conversion to std_logic_vector when needed."""
+    if kind.is_single_bit or base_type.lower() == "std_logic_vector":
+        return expr
+    return f"std_logic_vector({expr})"
+
+
+def _from_slv_expr(expr: str, kind: FieldKind, base_type: str) -> str:
+    if kind.is_single_bit or base_type.lower() == "std_logic_vector":
+        return expr
+    return f"{base_type}({expr})"
 
 
 def _to_slv(fld: Field, naming: Naming) -> str:
@@ -136,27 +192,106 @@ def _to_slv(fld: Field, naming: Naming) -> str:
     src = f"value.{fld.name}"
     if fld.kind is FieldKind.RECORD:
         return f"{naming.serialize_fn(fld.record_type)}({src})"
-    if fld.kind is FieldKind.STD_LOGIC:
-        return src
-    if fld.base_type.lower() == "std_logic_vector":
-        return src
-    return f"std_logic_vector({src})"
+    if fld.kind is FieldKind.RECORD_VECTOR:
+        base = element_base(fld, naming)
+        return f"{naming.serialize_vector_fn_of(base)}({src})"
+    return _as_slv(src, fld.kind, fld.base_type)
 
 
 def _from_slv(fld: Field, rec: RecordDef, naming: Naming) -> str:
     sl = _slice_of(fld, rec, naming, "src")
     if fld.kind is FieldKind.RECORD:
         return f"{naming.deserialize_fn(fld.record_type)}({sl})"
-    if fld.kind is FieldKind.STD_LOGIC:
-        return sl
-    if fld.base_type.lower() == "std_logic_vector":
-        return sl
-    return f"{fld.base_type}({sl})"
+    if fld.kind is FieldKind.RECORD_VECTOR:
+        base = element_base(fld, naming)
+        return f"{naming.deserialize_vector_fn_of(base)}({sl})"
+    return _from_slv_expr(sl, fld.kind, fld.base_type)
 
 
 def _aligned(pairs: list[tuple[str, str]], sep: str = " := ") -> list[str]:
     width = max((len(lhs) for lhs, _ in pairs), default=0)
     return [f"{lhs.ljust(width)}{sep}{rhs}" for lhs, rhs in pairs]
+
+
+def _render_statements(items: list, indent: str) -> list[str]:
+    """Render assignments (aligned in runs) and multi-line blocks in order."""
+    out: list[str] = []
+    run: list[tuple[str, str]] = []
+    for item in items:
+        if isinstance(item, tuple):
+            run.append(item)
+            continue
+        if run:
+            out += [f"{indent}{line};" for line in _aligned(run)]
+            run = []
+        out += [f"{indent}{line}" for line in item]
+    if run:
+        out += [f"{indent}{line};" for line in _aligned(run)]
+    return out
+
+
+def _decl_lines(entries: list[tuple[str, str, str]], indent: str) -> list[str]:
+    """Render aligned ``constant`` / ``variable`` declarations."""
+    pad = max((len(name) for _, name, _ in entries), default=0)
+    return [f"{indent}{kind} {name.ljust(pad)} : {what};"
+            for kind, name, what in entries]
+
+
+def _vector_decl(fld: Field, naming: Naming) -> str:
+    """Type of the temporary holding a deserialized array."""
+    info = fld.array
+    if not info.type_unconstrained:
+        return info.vector_type
+    count = info.count
+    last = str(count.const - 1) if count.is_static else f"{count.render()} - 1"
+    return f"{info.vector_type}(0 to {last})"
+
+
+# --------------------------------------------------------------------------
+# per-field statements
+# --------------------------------------------------------------------------
+def _scalar_array_block(fld: Field, rec: RecordDef, naming: Naming,
+                        serialize: bool) -> list[str]:
+    """Element-by-element copy of an array of std_logic / slv / unsigned."""
+    info = fld.array
+    low = naming.bound_const(rec.name, fld.name, "LOW")
+    width = info.element_width
+    if serialize:
+        array_ref = f"value.{fld.name}"
+        left = (f"result({OFFSET_VAR})" if info.element_kind.is_single_bit
+                else f"result({_span(OFFSET_VAR, width)})")
+        right = _as_slv(f"{array_ref}(i)", info.element_kind,
+                        info.element_base_type)
+    else:
+        array_ref = f"result.{fld.name}"
+        left = f"{array_ref}(i)"
+        chunk = (f"src({OFFSET_VAR})" if info.element_kind.is_single_bit
+                 else f"src({_span(OFFSET_VAR, width)})")
+        right = _from_slv_expr(chunk, info.element_kind,
+                               info.element_base_type)
+    # the '* 1' of single-bit elements would be noise
+    stride = "" if width.is_static and width.const == 1 else f" * {width.render()}"
+    return [
+        f"for i in {array_ref}'range loop",
+        f"{IND}{OFFSET_VAR} := {low} + (i - {array_ref}'low){stride};",
+        f"{IND}{left} := {right};",
+        "end loop;",
+    ]
+
+
+def _descending_array_block(fld: Field, rec: RecordDef, naming: Naming,
+                            temp: str) -> list[str]:
+    """Deserialize a 'downto' record array, keeping index order, not position."""
+    base = element_base(fld, naming)
+    ref = f"result.{fld.name}"
+    return [
+        f"{temp} := {naming.deserialize_vector_fn_of(base)}"
+        f"({_slice_of(fld, rec, naming, 'src')});",
+        f"-- '{fld.name}' runs downto: map by index, lowest index on the LSBs",
+        f"for i in {ref}'range loop",
+        f"{IND}{ref}(i) := {temp}(i - {ref}'low);",
+        "end loop;",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -175,7 +310,10 @@ def _layout_comment(rec: RecordDef, naming: Naming,
             pos = f"[{high:>4} : {low:>4}]"
         else:
             pos = f"[+{field_width(fld, naming).render():>11}]"
-        out.append(f"{IND}--   {pos}  {fld.name} : {fld.type_name}")
+        note = ""
+        if fld.kind.is_array:
+            note = "  (lowest index on the LSBs)"
+        out.append(f"{IND}--   {pos}  {fld.name} : {fld.type_name}{note}")
     bits = sizes.get(rec.name.lower())
     if bits is not None:
         out.append(f"{IND}--   total: {bits} bits")
@@ -197,6 +335,16 @@ def _declaration(rec: RecordDef, naming: Naming,
                f"(value : {rec.name}) return std_logic_vector;")
     out.append(f"{IND}function {naming.deserialize_fn(rec.name)} "
                f"(data : std_logic_vector) return {rec.name};")
+    if rec.vector is not None:
+        base = naming.base(rec.name)
+        vec = rec.vector.name
+        out.append("")
+        out.append(f"{IND}-- {vec}: serialized element by element, "
+                   f"lowest index on the LSBs")
+        out.append(f"{IND}function {naming.serialize_vector_fn_of(base)} "
+                   f"(value : {vec}) return std_logic_vector;")
+        out.append(f"{IND}function {naming.deserialize_vector_fn_of(base)} "
+                   f"(data : std_logic_vector) return {vec};")
     out.append("")
     return out
 
@@ -209,7 +357,7 @@ def _bound_constants(rec: RecordDef, naming: Naming) -> list[str]:
         low = naming.bound_const(rec.name, fld.name, "LOW")
         rows.append((low, "0" if previous is None else f"{previous} + 1"))
         previous = low
-        if fld.kind is FieldKind.STD_LOGIC:
+        if fld.kind.is_single_bit:
             continue  # single bit: the HIGH bound would be redundant
         width = field_width(fld, naming)
         if width.is_static:
@@ -227,14 +375,23 @@ def _bound_constants(rec: RecordDef, naming: Naming) -> list[str]:
 def _serialize_body(rec: RecordDef, naming: Naming) -> list[str]:
     fn = naming.serialize_fn(rec.name)
     width = naming.width_const(rec.name)
-    out = [
-        f"{IND}function {fn} (value : {rec.name}) return std_logic_vector is",
-        f"{IND * 2}variable result : std_logic_vector({width} - 1 downto 0);",
-        f"{IND}begin",
-    ]
-    pairs = [(_slice_of(f, rec, naming, "result"), _to_slv(f, naming))
-             for f in rec.fields]
-    out += [f"{IND * 2}{line};" for line in _aligned(pairs)]
+    items: list = []
+    needs_offset = False
+    for fld in rec.fields:
+        if fld.kind is FieldKind.SCALAR_VECTOR:
+            needs_offset = True
+            items.append(_scalar_array_block(fld, rec, naming, True))
+        else:
+            items.append((_slice_of(fld, rec, naming, "result"),
+                          _to_slv(fld, naming)))
+
+    decls = [("variable", "result", f"std_logic_vector({width} - 1 downto 0)")]
+    if needs_offset:
+        decls.append(("variable", OFFSET_VAR, "natural"))
+    out = [f"{IND}function {fn} (value : {rec.name}) return std_logic_vector is"]
+    out += _decl_lines(decls, IND * 2)
+    out.append(f"{IND}begin")
+    out += _render_statements(items, IND * 2)
     out += [f"{IND * 2}return result;", f"{IND}end function {fn};", ""]
     return out
 
@@ -243,23 +400,105 @@ def _deserialize_body(rec: RecordDef, naming: Naming,
                       with_assert: bool) -> list[str]:
     fn = naming.deserialize_fn(rec.name)
     width = naming.width_const(rec.name)
-    out = [
-        f"{IND}function {fn} (data : std_logic_vector) return {rec.name} is",
-        f"{IND * 2}variable src    : std_logic_vector({width} - 1 downto 0);",
-        f"{IND * 2}variable result : {rec.name};",
-        f"{IND}begin",
+    items: list = []
+    decls: list[tuple[str, str, str]] = [
+        ("variable", "src", f"std_logic_vector({width} - 1 downto 0)"),
+        ("variable", "result", rec.name),
     ]
+    temps: list[tuple[str, str, str]] = []
+    needs_offset = False
+    for fld in rec.fields:
+        if fld.kind is FieldKind.SCALAR_VECTOR:
+            needs_offset = True
+            items.append(_scalar_array_block(fld, rec, naming, False))
+        elif fld.kind is FieldKind.RECORD_VECTOR and fld.array.descending:
+            temp = f"{fld.name}_v"
+            temps.append(("variable", temp, _vector_decl(fld, naming)))
+            items.append(_descending_array_block(fld, rec, naming, temp))
+        else:
+            items.append((f"result.{fld.name}", _from_slv(fld, rec, naming)))
+
+    if needs_offset:
+        decls.append(("variable", OFFSET_VAR, "natural"))
+    out = [f"{IND}function {fn} (data : std_logic_vector) return {rec.name} is"]
+    out += _decl_lines(decls + temps, IND * 2)
+    out.append(f"{IND}begin")
     if with_assert:
+        out += _length_assert(fn, f"data'length = {width}", width)
+    out.append(f"{IND * 2}src := data;")
+    out += _render_statements(items, IND * 2)
+    out += [f"{IND * 2}return result;", f"{IND}end function {fn};", ""]
+    return out
+
+
+def _length_assert(fn: str, condition: str, width: str) -> list[str]:
+    return [
+        f"{IND * 2}assert {condition}",
+        f"{IND * 3}report \"{fn}: expected \" & integer'image({width})",
+        f"{IND * 3}       & \" bits, got \" & integer'image(data'length)",
+        f"{IND * 3}severity failure;",
+    ]
+
+
+def _vector_bodies(rec: RecordDef, naming: Naming,
+                   with_assert: bool) -> list[str]:
+    """The two functions handling an array of this record."""
+    if rec.vector is None:
+        return []
+    base = naming.base(rec.name)
+    vec = rec.vector.name
+    width = naming.width_const(rec.name)
+    ser = naming.serialize_vector_fn_of(base)
+    deser = naming.deserialize_vector_fn_of(base)
+    span = f"{OFFSET_VAR} + {width} - 1 downto {OFFSET_VAR}"
+
+    out = [f"{IND}function {ser} (value : {vec}) return std_logic_vector is"]
+    out += _decl_lines(
+        [("variable", "result",
+          f"std_logic_vector(value'length * {width} - 1 downto 0)"),
+         ("variable", OFFSET_VAR, "natural")], IND * 2)
+    out += [
+        f"{IND}begin",
+        f"{IND * 2}for i in value'range loop",
+        f"{IND * 3}{OFFSET_VAR} := (i - value'low) * {width};",
+        f"{IND * 3}result({span}) := {naming.serialize_fn_of(base)}(value(i));",
+        f"{IND * 2}end loop;",
+        f"{IND * 2}return result;",
+        f"{IND}end function {ser};",
+        "",
+    ]
+
+    out.append(f"{IND}function {deser} (data : std_logic_vector) return {vec} is")
+    decls: list[tuple[str, str, str]] = []
+    if rec.vector.unconstrained:
+        decls.append(("constant", "COUNT", f"natural := data'length / {width}"))
+    decls += [
+        ("variable", "src", "std_logic_vector(data'length - 1 downto 0)"),
+        ("variable", "result",
+         f"{vec}(0 to COUNT - 1)" if rec.vector.unconstrained else vec),
+        ("variable", OFFSET_VAR, "natural"),
+    ]
+    out += _decl_lines(decls, IND * 2)
+    out.append(f"{IND}begin")
+    if with_assert:
+        count = "COUNT" if rec.vector.unconstrained else "result'length"
         out += [
-            f"{IND * 2}assert data'length = {width}",
-            f"{IND * 3}report \"{fn}: expected \" & integer'image({width})",
+            f"{IND * 2}assert data'length = {count} * {width}",
+            f"{IND * 3}report \"{deser}: expected \" "
+            f"& integer'image({count} * {width})",
             f"{IND * 3}       & \" bits, got \" & integer'image(data'length)",
             f"{IND * 3}severity failure;",
         ]
-    out.append(f"{IND * 2}src := data;")
-    pairs = [(f"result.{f.name}", _from_slv(f, rec, naming)) for f in rec.fields]
-    out += [f"{IND * 2}{line};" for line in _aligned(pairs)]
-    out += [f"{IND * 2}return result;", f"{IND}end function {fn};", ""]
+    out += [
+        f"{IND * 2}src := data;",
+        f"{IND * 2}for i in result'range loop",
+        f"{IND * 3}{OFFSET_VAR} := (i - result'low) * {width};",
+        f"{IND * 3}result(i) := {naming.deserialize_fn_of(base)}(src({span}));",
+        f"{IND * 2}end loop;",
+        f"{IND * 2}return result;",
+        f"{IND}end function {deser};",
+        "",
+    ]
     return out
 
 
@@ -294,7 +533,8 @@ def generate(records: list[RecordDef], opts: GenOptions) -> str:
         "--",
         "-- Record serialization helpers. Packing convention: the first field of a",
         "-- record occupies the least significant bits, the last field the most",
-        "-- significant ones. A nested record is serialized through the functions",
+        "-- significant ones; in an array, the lowest index occupies the least",
+        "-- significant bits. A nested record is serialized through the functions",
         "-- of the same naming convention.",
     ]
     if opts.sources:
@@ -328,6 +568,7 @@ def generate(records: list[RecordDef], opts: GenOptions) -> str:
         lines.append("")
         lines += _serialize_body(rec, naming)
         lines += _deserialize_body(rec, naming, opts.include_assert)
+        lines += _vector_bodies(rec, naming, opts.include_assert)
     lines += [f"end package body {opts.package_name};", ""]
 
     return "\n".join(lines)
