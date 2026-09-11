@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vhdl-serdes"
+version = "1.0.0"
+description = "Generate VHDL record serialization / deserialization functions"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+vhdl-serdes = "vhdl_serdes.cli:main"
+
+[tool.setuptools]
+packages = ["vhdl_serdes"]
