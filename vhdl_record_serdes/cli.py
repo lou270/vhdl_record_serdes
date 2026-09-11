@@ -1,4 +1,4 @@
-"""Command line interface: vhdl-serdes / python -m vhdl_serdes."""
+"""Command line interface: vhdl-record-serdes / python -m vhdl_record_serdes."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ sait pas traiter est ignore avec un avertissement (--strict pour arreter).
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="vhdl-serdes",
+        prog="vhdl-record-serdes",
         description=DESCRIPTION,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

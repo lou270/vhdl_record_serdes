@@ -1,4 +1,4 @@
-# vhdl_serdes
+# vhdl_record_serdes
 
 Génère les fonctions VHDL de sérialisation / désérialisation des `record` trouvés
 dans des fichiers VHDL.
@@ -26,20 +26,20 @@ Le tout dans un package + package body (`<entrée>_serdes_pkg.vhd` par défaut).
 ## Utilisation
 
 ```bash
-python -m vhdl_serdes examples/example_pkg.vhd -o examples/example_serdes_pkg.vhd
+python -m vhdl_record_serdes examples/example_pkg.vhd -o examples/example_serdes_pkg.vhd
 ```
 
 Un **dossier** est parcouru automatiquement (récursivement) à la recherche des
 fichiers VHDL :
 
 ```bash
-python -m vhdl_serdes rtl/ -o rtl/projet_serdes_pkg.vhd
+python -m vhdl_record_serdes rtl/ -o rtl/projet_serdes_pkg.vhd
 ```
 
 Inspection sans génération :
 
 ```bash
-python -m vhdl_serdes examples/example_pkg.vhd --list
+python -m vhdl_record_serdes examples/example_pkg.vhd --list
 ```
 
 ```
@@ -53,7 +53,7 @@ timestamp_t  (examples/example_pkg.vhd:15)  -> 48 bits
 Fichiers et dossiers peuvent être mélangés ; tous les records trouvés sont
 générés dans un seul package, dans un ordre qui respecte leurs dépendances.
 
-Installation optionnelle (fournit la commande `vhdl-serdes`) :
+Installation optionnelle (fournit la commande `vhdl-record-serdes`) :
 
 ```bash
 pip install -e .
@@ -155,7 +155,7 @@ Un record ignoré entraîne l'abandon de ceux qui le contiennent, signalé
 également. `--strict` transforme tous ces avertissements en erreur.
 
 ```
-$ python -m vhdl_serdes rtl/ --list
+$ python -m vhdl_record_serdes rtl/ --list
 3 fichier(s) lu(s), 3 record(s) trouve(s)
 avertissement: record 'stats_t' ignore: rtl/common/misc_pkg.vhd:2: stats_t.count:
   type 'integer' non supporte (utilisez unsigned/signed avec une largeur explicite)
@@ -271,9 +271,9 @@ python -m unittest discover -s tests -t .
 
 | Fichier | Rôle |
 |---------|------|
-| `vhdl_serdes/model.py` | modèle de données (`Field`, `RecordDef`, `Width`, `Naming`) |
-| `vhdl_serdes/parser.py` | lecture du VHDL : records, subtypes, résolution des types |
-| `vhdl_serdes/generator.py` | émission du package + package body |
-| `vhdl_serdes/cli.py` | interface en ligne de commande |
+| `vhdl_record_serdes/model.py` | modèle de données (`Field`, `RecordDef`, `Width`, `Naming`) |
+| `vhdl_record_serdes/parser.py` | lecture du VHDL : records, subtypes, résolution des types |
+| `vhdl_record_serdes/generator.py` | émission du package + package body |
+| `vhdl_record_serdes/cli.py` | interface en ligne de commande |
 | `examples/example_pkg.vhd` | entrée d'exemple |
 | `examples/example_serdes_pkg.vhd` | sortie correspondante |

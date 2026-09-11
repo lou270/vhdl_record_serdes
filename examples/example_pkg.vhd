@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- Exemple d'entree pour vhdl_serdes.
+-- Exemple d'entree pour vhdl_record_serdes.
 --------------------------------------------------------------------------------
 library ieee;
   use ieee.std_logic_1164.all;

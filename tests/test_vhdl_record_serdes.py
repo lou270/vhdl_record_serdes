@@ -9,11 +9,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vhdl_serdes import FieldKind, GenOptions, Naming, VhdlSerdesError, generate
-from vhdl_serdes.cli import main
-from vhdl_serdes.generator import (element_base, field_width, layout,
+from vhdl_record_serdes import FieldKind, GenOptions, Naming, VhdlSerdesError, generate
+from vhdl_record_serdes.cli import main
+from vhdl_record_serdes.generator import (element_base, field_width, layout,
                                    record_width, sort_records, static_sizes)
-from vhdl_serdes.parser import (VhdlSource, collect_vhdl_files,
+from vhdl_record_serdes.parser import (VhdlSource, collect_vhdl_files,
                                 strip_comments)
 
 SIMPLE = """
